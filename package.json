@@ -1,0 +1,26 @@
+{
+  "name": "upasthiti-setu-backend",
+  "version": "1.0.0",
+  "description": "Upasthiti Setu - labour attendance, wages and ID card system (API)",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "seed": "node src/seed.js",
+    "test": "node --test test/*.test.js",
+    "test:e2e": "npm run seed && node test/e2e.mjs"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.4",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.7.0",
+    "helmet": "^8.3.0",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.10.2",
+    "morgan": "^1.12.1"
+  }
+}

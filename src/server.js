@@ -9,6 +9,10 @@ const { notFound, errorHandler } = require('./middleware/error');
 
 const app = express();
 
+// Render / Railway / Heroku put the app behind a proxy.
+// Without this, the rate limiter would see every user as the same IP.
+app.set('trust proxy', 1);
+
 // cross-origin resource policy lets the frontend (another domain after deploy) show photos
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 // Allowed frontends: the website(s) in CLIENT_URL (comma separated) + the Android app (Capacitor)
@@ -31,6 +35,7 @@ if (process.env.NODE_ENV !== 'test') app.use(morgan('dev'));
 // Slow down password guessing on login/register
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false });
 
+app.get('/', (req, res) => res.json({ ok: true, app: 'Upasthiti Setu API', health: '/api/health' }));
 app.get('/api/health', (req, res) => res.json({ ok: true, app: 'Upasthiti Setu' }));
 app.use('/api/auth', authLimiter, require('./routes/auth'));
 app.use('/api/contractor', require('./routes/contractor'));
@@ -39,6 +44,8 @@ app.use('/api/sites', require('./routes/sites'));
 app.use('/api/attendance', require('./routes/attendance'));
 app.use('/api/money', require('./routes/money'));
 app.use('/api/verify', require('./routes/verify'));
+// Web page opened by scanning the ID card QR (works without a deployed website)
+app.get('/verify/:token', require('./routes/verify').verifyPage);
 
 app.use(notFound);
 app.use(errorHandler);

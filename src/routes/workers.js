@@ -1,12 +1,16 @@
 const express = require('express');
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const User = require('../models/User');
 const Site = require('../models/Site');
+const Attendance = require('../models/Attendance');
 const { protect, allow, activeWorker } = require('../middleware/auth');
 const { asyncHandler, httpError } = require('../middleware/error');
-const { LEVELS } = require('../utils/skill');
+const { LEVELS, DEFAULT_WAGE } = require('../utils/skill');
 const { createIdToken } = require('../utils/idToken');
 const { workerLedger, closeForgottenCheckouts } = require('../utils/ledger');
 const { todayIST, weekRange } = require('../utils/dates');
+const { isProtectedDemoUser } = require('../utils/demo');
 
 const router = express.Router();
 router.use(protect);
@@ -23,9 +27,26 @@ function addMonths(date, months) {
   return d;
 }
 
+// Saves the current job into the worker's portable work history (only if they were approved)
+async function closeCurrentJob(worker) {
+  if (!worker.contractor || !worker.workerCode) return;
+  const last = worker.pastJobs[worker.pastJobs.length - 1];
+  if (last && String(last.contractor) === String(worker.contractor) && last.workerCode === worker.workerCode) return;
+  const contractor = await User.findById(worker.contractor).select('companyName');
+  worker.pastJobs.push({
+    contractor: worker.contractor,
+    companyName: contractor?.companyName,
+    workerCode: worker.workerCode,
+    trade: worker.trade,
+    level: worker.level,
+    from: worker.approvedAt,
+    to: new Date(),
+  });
+}
+
 // ---------------- Worker's own endpoints ----------------
 
-// GET /api/workers/me/summary  – money + this week
+// GET /api/workers/me/summary  – money + this week (with the current contractor)
 router.get(
   '/me/summary',
   allow('worker'),
@@ -33,11 +54,16 @@ router.get(
   asyncHandler(async (req, res) => {
     const contractor = await User.findById(req.user.contractor);
     await closeForgottenCheckouts({ worker: req.user._id }, todayIST());
-    const ledger = await workerLedger(req.user._id, {
+    const ledger = await workerLedger(req.user._id, req.user.contractor, {
       ...weekRange(),
       advanceLimit: contractor.settings.advanceLimit,
     });
-    res.json({ ledger, dailyWage: req.user.dailyWage, level: req.user.level });
+    res.json({
+      ledger,
+      dailyWage: req.user.dailyWage,
+      level: req.user.level,
+      overtimeRatePerHour: Math.round((req.user.dailyWage / 8) * contractor.settings.overtimeMultiplier),
+    });
   })
 );
 
@@ -49,7 +75,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const worker = await User.findById(req.user._id).populate('contractor', 'companyName name phone');
     const token = createIdToken(worker);
-    const base = process.env.PUBLIC_VERIFY_BASE || 'http://localhost:5173/verify';
+    const base = process.env.PUBLIC_VERIFY_BASE || 'http://localhost:5000/verify';
     res.json({
       card: {
         name: worker.name,
@@ -69,6 +95,85 @@ router.get(
   })
 );
 
+// GET /api/workers/me/history – portable work history across contractors (proof of experience)
+router.get(
+  '/me/history',
+  allow('worker'),
+  asyncHandler(async (req, res) => {
+    const days = await Attendance.find({ worker: req.user._id, dayValue: { $gt: 0 } }).select('contractor dayValue').lean();
+    const daysByContractor = {};
+    for (const d of days) daysByContractor[d.contractor] = (daysByContractor[d.contractor] || 0) + d.dayValue;
+
+    const current = await User.findById(req.user.contractor).select('companyName');
+    const jobs = req.user.pastJobs.map((j) => ({ ...j.toObject(), days: daysByContractor[j.contractor] || 0 }));
+    if (req.user.status === 'active') {
+      jobs.push({
+        contractor: req.user.contractor,
+        companyName: current?.companyName,
+        workerCode: req.user.workerCode,
+        trade: req.user.trade,
+        level: req.user.level,
+        from: req.user.approvedAt,
+        to: null,
+        current: true,
+        days: daysByContractor[req.user.contractor] || 0,
+      });
+    }
+    res.json({ jobs: jobs.reverse(), totalDays: days.reduce((s, d) => s + d.dayValue, 0) });
+  })
+);
+
+// POST /api/workers/me/leave – stop working with the current contractor
+router.post(
+  '/me/leave',
+  allow('worker'),
+  asyncHandler(async (req, res) => {
+    const w = req.user;
+    if (!['active', 'pending'].includes(w.status)) throw httpError(400, 'You are not working with a contractor now');
+    const open = await Attendance.exists({ worker: w._id, status: 'in_progress' });
+    if (open) throw httpError(400, 'Check out from today\'s work first');
+
+    await closeCurrentJob(w);
+    w.status = 'inactive';
+    w.assignedSite = undefined;
+    w.idVersion += 1; // old ID card QR now shows "replaced"
+    await w.save();
+    res.json({ user: w.toSafeJSON(), message: 'You have left. Your old records stay safe. You can join a new contractor now.' });
+  })
+);
+
+// POST /api/workers/me/join  { joinCode } – join a new contractor (after leaving / being removed / rejected)
+router.post(
+  '/me/join',
+  allow('worker'),
+  asyncHandler(async (req, res) => {
+    const w = req.user;
+    if (w.status === 'active') throw httpError(400, 'Leave your current contractor first');
+
+    const contractor = await User.findOne({
+      role: 'contractor',
+      joinCode: String(req.body.joinCode || '').trim().toUpperCase(),
+    });
+    if (!contractor) throw httpError(404, 'Contractor code not found');
+    if (String(contractor._id) === String(w.contractor) && w.status === 'pending') {
+      throw httpError(400, 'You have already asked this contractor. Wait for approval');
+    }
+
+    await closeCurrentJob(w);
+    w.contractor = contractor._id;
+    w.status = 'pending';
+    w.workerCode = undefined; // new contractor gives a new code on approval
+    w.assignedSite = undefined;
+    w.level = w.suggestedLevel || w.level;
+    w.dailyWage = DEFAULT_WAGE[w.level] || w.dailyWage;
+    w.cleanDays = 0; // trust is built again with the new contractor
+    w.idVersion += 1;
+    w.approvedAt = undefined;
+    await w.save();
+    res.json({ user: w.toSafeJSON(), message: `Request sent to ${contractor.companyName}` });
+  })
+);
+
 // ---------------- Contractor endpoints ----------------
 
 // GET /api/workers?status=pending
@@ -85,14 +190,14 @@ router.get(
   })
 );
 
-// GET /api/workers/:id  – profile + ledger
+// GET /api/workers/:id  – profile + ledger with this contractor
 router.get(
   '/:id',
   allow('contractor'),
   asyncHandler(async (req, res) => {
     const worker = await findMyWorker(req.user._id, req.params.id);
     await worker.populate('assignedSite', 'name');
-    const ledger = await workerLedger(worker._id, {
+    const ledger = await workerLedger(worker._id, req.user._id, {
       ...weekRange(),
       advanceLimit: req.user.settings.advanceLimit,
     });
@@ -208,6 +313,26 @@ router.post(
     worker.idValidTill = addMonths(new Date(), req.user.settings.idValidityMonths);
     await worker.save();
     res.json({ message: 'New ID card issued. Old QR code no longer works.' });
+  })
+);
+
+// POST /api/workers/:id/reset-password – worker forgot password; contractor gives a temporary one
+router.post(
+  '/:id/reset-password',
+  allow('contractor'),
+  asyncHandler(async (req, res) => {
+    const worker = await findMyWorker(req.user._id, req.params.id);
+    if (isProtectedDemoUser(worker)) throw httpError(403, 'Demo accounts cannot be reset');
+
+    const tempPassword = String(crypto.randomInt(100000, 1000000)); // 6 digits, easy to tell on phone
+    await User.updateOne(
+      { _id: worker._id },
+      { $set: { passwordHash: await bcrypt.hash(tempPassword, 10) }, $inc: { tokenVersion: 1 } }
+    );
+    res.json({
+      tempPassword,
+      message: `Tell ${worker.name} this password. They should change it after logging in.`,
+    });
   })
 );
 

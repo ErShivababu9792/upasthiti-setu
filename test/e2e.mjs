@@ -41,6 +41,11 @@ const sites = (await call('GET', '/sites', c)).data.sites;
 r = await call('POST', `/workers/${wid}/approve`, c, { level: 'skilled', dailyWage: 1100, siteId: sites[0]._id });
 check('contractor approves with adjusted wage', r.data.worker?.status === 'active' && r.data.worker.dailyWage === 1100 && r.data.worker.workerCode === 'US-0003', r.data);
 
+r = await call('POST', '/attendance/check-in', w, { lat: 12.9699, lng: 77.7501 });
+check('check-in needs location consent first', r.status === 428, r.data);
+r = await call('PATCH', '/auth/me', w, { locationConsent: true });
+check('consent saved', !!r.data.user?.locationConsentAt, r.data);
+
 r = await call('POST', '/attendance/check-in', w, { lat: 12.99, lng: 77.75 });
 check('check-in far from site blocked', r.status === 400 && /away/.test(r.data.message), r.data);
 
@@ -136,5 +141,65 @@ check('weekly summary', r.data.rows?.length === 3, r.data);
 
 r = await call('GET', '/workers', w);
 check('worker cannot use contractor routes', r.status === 403);
+
+// --- Step 1 fixes ---
+// Manual attendance by contractor (phone dead etc.)
+const suresh = (await call('GET', '/workers?status=active', c)).data.workers.find((x) => x.name === 'Suresh Gowda');
+r = await call('POST', '/attendance/manual', c, { workerId: suresh._id, hours: 11, reason: 'Phone not working' });
+check('manual attendance with overtime', r.status === 201 && r.data.record.manual && r.data.record.dayValue === 1 && r.data.record.overtimeHours === 2 && r.data.record.overtimePay === 200, r.data);
+r = await call('POST', '/attendance/manual', c, { workerId: suresh._id, hours: 8, reason: 'again' });
+check('manual attendance twice same day blocked', r.status === 409, r.data);
+r = await call('POST', '/attendance/manual', c, { workerId: suresh._id, hours: 8, reason: 'x', date: '2999-01-01' });
+check('manual attendance in future blocked', r.status === 400);
+
+// Monthly report CSV
+const rep = await fetch(`${B}/contractor/report?type=summary`, { headers: { Authorization: `Bearer ${c}` } });
+const bytes = Buffer.from(await rep.arrayBuffer());
+const csv = bytes.toString('utf8');
+const hasBom = bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf; // Excel needs this to show ₹ / Hindi
+check('summary report CSV', rep.headers.get('content-type').includes('text/csv') && csv.includes('Suresh Gowda') && hasBom, csv.slice(0, 120));
+const rep2 = await fetch(`${B}/contractor/report?type=attendance`, { headers: { Authorization: `Bearer ${c}` } });
+check('attendance report CSV', (await rep2.text()).includes('Phone not working'));
+
+// Contractor resets a worker's forgotten password
+r = await call('POST', `/workers/${wid}/reset-password`, c);
+check('contractor resets password', /^\d{6}$/.test(r.data.tempPassword || ''), r.data);
+const temp = r.data.tempPassword;
+r = await call('GET', '/auth/me', w);
+check('old token logged out after reset', r.status === 401);
+let w2 = (await call('POST', '/auth/login', null, { phone: '9111111111', password: temp })).data.token;
+check('login with temporary password', !!w2);
+
+// Worker changes own password → other sessions logged out
+r = await call('POST', '/auth/change-password', w2, { oldPassword: 'wrong', newPassword: 'newpass1' });
+check('change password needs old password', r.status === 400);
+r = await call('POST', '/auth/change-password', w2, { oldPassword: temp, newPassword: 'newpass1' });
+check('password changed, new token given', !!r.data.token, r.data);
+const oldW2 = w2;
+w2 = r.data.token;
+check('previous session logged out', (await call('GET', '/auth/me', oldW2)).status === 401);
+
+// Worker changes contractor
+const other = (await call('POST', '/auth/register/contractor', null, { name: 'Raju', phone: '9444444444', password: 'secret1', companyName: 'Raju Interiors' })).data;
+r = await call('POST', '/workers/me/join', w2, { joinCode: other.user.joinCode });
+check('must leave before joining new contractor', r.status === 400);
+r = await call('POST', '/workers/me/leave', w2);
+check('worker leaves contractor', r.data.user?.status === 'inactive', r.data);
+r = await call('POST', '/workers/me/join', w2, { joinCode: other.user.joinCode });
+check('worker joins new contractor as pending', r.data.user?.status === 'pending' && !r.data.user.workerCode, r.data);
+r = await call('GET', '/workers/me/history', w2);
+check('work history keeps old job', r.data.jobs?.[0]?.companyName === 'Shiva Build Mart' && r.data.jobs[0].days === 1, r.data);
+r = await call('POST', `/workers/${wid}/approve`, other.token, { dailyWage: 900 });
+check('new contractor approves, new code', r.data.worker?.workerCode === 'US-0001', r.data);
+r = await call('GET', '/workers/me/summary', w2);
+check('ledger is fresh with new contractor', r.data.ledger?.earned === 0 && r.data.ledger.paid === 0, r.data);
+r = await call('GET', `/workers/${wid}`, c);
+check('old contractor no longer controls worker', r.status === 404);
+r = await call('POST', '/auth/register/worker', null, { name: 'Dup', phone: '9111111111', password: 'secret1', joinCode: 'SHIVA1', trade: 'painter' });
+check('same phone cannot register twice', r.status === 409);
+
+// Privacy page
+const priv = await fetch('http://localhost:5000/privacy');
+check('privacy page', priv.status === 200 && (await priv.text()).includes('only at the moment you check in'));
 
 console.log(fails ? `\n${fails} FAILED` : '\nALL PASSED');

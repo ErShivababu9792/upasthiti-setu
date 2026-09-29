@@ -6,6 +6,7 @@ const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const connectDB = require('./config/db');
 const { notFound, errorHandler } = require('./middleware/error');
+const { demoAutoReset } = require('./utils/demo');
 
 const app = express();
 
@@ -26,16 +27,27 @@ app.use(
     origin: (origin, cb) => cb(null, !origin || allowedOrigins.includes(origin)),
   })
 );
+if (process.env.NODE_ENV !== 'test') app.use(morgan('dev'));
+
+// Rate limits: strict on login/register (password guessing), relaxed for the rest of the API
+const limiterOptions = {
+  windowMs: 15 * 60 * 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many attempts. Please wait 15 minutes and try again' }, // JSON so the app can show it
+};
+const authLimiter = rateLimit({ ...limiterOptions, max: 100 });
+const apiLimiter = rateLimit({ ...limiterOptions, max: 1500 });
+app.use('/api', apiLimiter);
+
+// Public live demo: rebuild demo data once a day (only when DEMO_MODE=true)
+app.use('/api', demoAutoReset());
 
 // Photo uploads need a bigger body limit, so they are mounted before the normal JSON parser
 app.use('/api/photos', express.json({ limit: '1mb' }), require('./routes/photos'));
 app.use(express.json({ limit: '100kb' }));
-if (process.env.NODE_ENV !== 'test') app.use(morgan('dev'));
 
-// Slow down password guessing on login/register
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false });
-
-app.get('/', (req, res) => res.json({ ok: true, app: 'Upasthiti Setu API', health: '/api/health' }));
+app.get('/', (req, res) => res.json({ ok: true, app: 'Upasthiti Setu API', health: '/api/health', privacy: '/privacy' }));
 app.get('/api/health', (req, res) => res.json({ ok: true, app: 'Upasthiti Setu' }));
 app.use('/api/auth', authLimiter, require('./routes/auth'));
 app.use('/api/contractor', require('./routes/contractor'));
@@ -46,6 +58,8 @@ app.use('/api/money', require('./routes/money'));
 app.use('/api/verify', require('./routes/verify'));
 // Web page opened by scanning the ID card QR (works without a deployed website)
 app.get('/verify/:token', require('./routes/verify').verifyPage);
+// Privacy policy page (needed for Google Play)
+app.use(require('./routes/pages'));
 
 app.use(notFound);
 app.use(errorHandler);

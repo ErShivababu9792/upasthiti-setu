@@ -4,7 +4,7 @@ const Payment = require('../models/Payment');
 const User = require('../models/User');
 const { protect, allow, activeWorker } = require('../middleware/auth');
 const { asyncHandler, httpError } = require('../middleware/error');
-const { workerLedger } = require('../utils/ledger');
+const { workerLedger, contractorLedgers } = require('../utils/ledger');
 const { todayIST, weekRange } = require('../utils/dates');
 
 const router = express.Router();
@@ -15,6 +15,11 @@ function positiveAmount(value) {
   if (!(amount > 0)) throw httpError(400, 'Enter a valid amount');
   if (amount > 200000) throw httpError(400, 'Amount is too large');
   return amount;
+}
+
+// Worker sees records with their CURRENT contractor; contractor sees their own records
+function scope(user) {
+  return user.role === 'worker' ? { worker: user._id, contractor: user.contractor } : { contractor: user._id };
 }
 
 // =============== MONEY REQUESTS ===============
@@ -31,7 +36,7 @@ router.post(
     if (type === 'emergency' && reason.length < 3) throw httpError(400, 'Please write the reason for an emergency request');
 
     const contractor = await User.findById(req.user.contractor);
-    const ledger = await workerLedger(req.user._id, { advanceLimit: contractor.settings.advanceLimit });
+    const ledger = await workerLedger(req.user._id, contractor._id, { advanceLimit: contractor.settings.advanceLimit });
 
     if (ledger.hasOpenRequest) throw httpError(400, 'You already have a request waiting. Wait for it to be completed');
     if (amount > ledger.availableToRequest) {
@@ -53,7 +58,7 @@ router.post(
 router.get(
   '/requests',
   asyncHandler(async (req, res) => {
-    const filter = req.user.role === 'worker' ? { worker: req.user._id } : { contractor: req.user._id };
+    const filter = scope(req.user);
     if (req.query.status) filter.status = { $in: String(req.query.status).split(',') };
 
     const requests = await MoneyRequest.find(filter)
@@ -62,13 +67,13 @@ router.get(
       .limit(100)
       .lean();
 
-    // Contractor sees earned balance next to each open request to decide quickly
+    // Contractor sees earned balance next to each open request to decide quickly (2 queries for all)
     if (req.user.role === 'contractor') {
-      for (const r of requests) {
-        if (['pending', 'approved'].includes(r.status)) {
-          r.ledger = await workerLedger(r.worker._id, { advanceLimit: req.user.settings.advanceLimit });
-        }
-      }
+      const open = requests.filter((r) => ['pending', 'approved'].includes(r.status) && r.worker);
+      const ledgers = await contractorLedgers(req.user._id, [...new Set(open.map((r) => String(r.worker._id)))], {
+        advanceLimit: req.user.settings.advanceLimit,
+      });
+      for (const r of open) r.ledger = ledgers.get(String(r.worker._id));
     }
     res.json({ requests });
   })
@@ -100,13 +105,20 @@ router.post(
   })
 );
 
-// POST /api/money/requests/:id/pay  (contractor)  { method, note }
-// Marks an approved request as paid → creates a payment the worker must confirm
+/**
+ * POST /api/money/requests/:id/pay  (contractor)  { method, note }
+ * Marks an approved request as paid → creates a payment the worker must confirm.
+ *
+ * Safety:
+ *  1. Atomic claim (approved → paid): a double tap / two devices can't both pay
+ *  2. Unique index on payment.request: a second safety net in the database
+ *  3. If creating the payment fails, the claim is undone (paid → approved),
+ *     so a request is never left "paid" without a payment record
+ */
 router.post(
   '/requests/:id/pay',
   allow('contractor'),
   asyncHandler(async (req, res) => {
-    // Atomic status change: the same request can never be paid twice (double tap, two devices)
     const request = await MoneyRequest.findOneAndUpdate(
       { _id: req.params.id, contractor: req.user._id, status: 'approved' },
       { $set: { status: 'paid' } },
@@ -114,9 +126,9 @@ router.post(
     );
     if (!request) throw httpError(409, 'Request is not approved or is already paid');
 
-    const ledger = await workerLedger(request.worker);
     let payment;
     try {
+      const ledger = await workerLedger(request.worker, req.user._id);
       payment = await Payment.create({
         worker: request.worker,
         contractor: req.user._id,
@@ -128,8 +140,9 @@ router.post(
         request: request._id,
       });
     } catch (err) {
-      // Unique index on payment.request: a parallel call already created the payment
-      if (err.code === 11000) throw httpError(409, 'Request is already paid');
+      if (err.code === 11000) throw httpError(409, 'Request is already paid'); // parallel call won – keep "paid"
+      // Anything else: undo the claim so the contractor can try again
+      await MoneyRequest.updateOne({ _id: request._id, status: 'paid', payment: { $exists: false } }, { $set: { status: 'approved' } });
       throw err;
     }
     request.payment = payment._id;
@@ -166,10 +179,8 @@ router.post(
 router.get(
   '/payments',
   asyncHandler(async (req, res) => {
-    const filter =
-      req.user.role === 'worker'
-        ? { worker: req.user._id }
-        : { contractor: req.user._id, ...(req.query.workerId ? { worker: req.query.workerId } : {}) };
+    const filter = scope(req.user);
+    if (req.user.role === 'contractor' && req.query.workerId) filter.worker = req.query.workerId;
     if (req.query.status) filter.status = req.query.status;
 
     const payments = await Payment.find(filter)
@@ -231,7 +242,7 @@ router.delete(
 
 // =============== WEEKLY SUMMARY (payday) ===============
 
-// GET /api/money/weekly?date=YYYY-MM-DD  (contractor)
+// GET /api/money/weekly?date=YYYY-MM-DD  (contractor) – 3 queries in total, however many workers
 router.get(
   '/weekly',
   allow('contractor'),
@@ -241,11 +252,8 @@ router.get(
       .select('name workerCode trade dailyWage upiId')
       .lean();
 
-    const rows = [];
-    for (const w of workers) {
-      const ledger = await workerLedger(w._id, range);
-      rows.push({ worker: w, ...ledger });
-    }
+    const ledgers = await contractorLedgers(req.user._id, workers.map((w) => w._id), range);
+    const rows = workers.map((w) => ({ worker: w, ...ledgers.get(String(w._id)) }));
     const totals = {
       earnedThisWeek: rows.reduce((s, r) => s + r.period.earned, 0),
       balanceDue: rows.reduce((s, r) => s + Math.max(0, r.balance), 0),

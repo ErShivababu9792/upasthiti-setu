@@ -96,3 +96,27 @@ test('ID card token cannot be forged and old versions are detectable', () => {
   assert.strictEqual(readIdToken(`${payload}.fakeSignature123456789`), null);
   assert.strictEqual(readIdToken('garbage'), null);
 });
+
+const { overtimeFor } = require('../src/routes/attendance');
+const { buildLedger } = require('../src/utils/ledger');
+
+test('overtime: only hours beyond the limit, paid per hour', () => {
+  const s = { overtimeAfterHours: 9, overtimeMultiplier: 1 };
+  assert.deepStrictEqual(overtimeFor(8, 800, s), { overtimeHours: 0, overtimePay: 0 });
+  assert.deepStrictEqual(overtimeFor(11, 800, s), { overtimeHours: 2, overtimePay: 200 }); // 800/8 = 100 per hour
+  assert.deepStrictEqual(overtimeFor(11, 800, { ...s, overtimeMultiplier: 1.5 }), { overtimeHours: 2, overtimePay: 300 });
+});
+
+test('ledger: overtime counts only on full days, disputed money is excluded upstream', () => {
+  const days = [
+    { date: '2026-09-21', dayValue: 1, wageRate: 1000, overtimePay: 250, overtimeHours: 2 },
+    { date: '2026-09-22', dayValue: 0.5, wageRate: 1000, overtimePay: 999, overtimeHours: 9 }, // half day → no overtime
+  ];
+  const payments = [{ amount: 500, paidOn: '2026-09-22' }];
+  const l = buildLedger(days, payments, { from: '2026-09-21', to: '2026-09-27', advanceLimit: 1000 });
+  assert.strictEqual(l.earned, 1750); // 1000 + 250 + 500
+  assert.strictEqual(l.balance, 1250);
+  assert.strictEqual(l.overtimeHours, 2);
+  assert.strictEqual(l.availableToRequest, 2250);
+  assert.strictEqual(l.period.days, 1.5);
+});

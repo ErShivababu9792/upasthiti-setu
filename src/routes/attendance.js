@@ -53,6 +53,18 @@ function verifyDay({ hours, checkOutDistance, radius, photoCount = 0, workNote =
   return { status: 'half_day', dayValue: 0.5, flags };
 }
 
+/**
+ * Overtime = hours beyond `overtimeAfterHours`, paid at (daily wage ÷ 8) × multiplier per hour.
+ * Saved on the record at check-out, so later rule changes don't rewrite old days.
+ */
+function overtimeFor(hours, wageRate, settings) {
+  const after = settings.overtimeAfterHours ?? 9;
+  const multiplier = settings.overtimeMultiplier ?? 1;
+  const overtimeHours = Math.max(0, Math.round((hours - after) * 100) / 100);
+  const overtimePay = Math.round(overtimeHours * (wageRate / 8) * multiplier);
+  return { overtimeHours, overtimePay };
+}
+
 // ---------------- Worker ----------------
 
 // GET /api/attendance/today – worker's status for today
@@ -73,6 +85,8 @@ router.post(
   activeWorker,
   asyncHandler(async (req, res) => {
     const worker = req.user;
+    // Privacy law (DPDP Act): location is used only after the worker agrees
+    if (!worker.locationConsentAt) throw httpError(428, 'Please allow location use first');
     if (!worker.assignedSite) throw httpError(400, 'You are not assigned to any site yet. Contact your contractor');
 
     const site = await Site.findOne({ _id: worker.assignedSite, active: true });
@@ -154,6 +168,7 @@ router.post(
     record.hours = hours;
     record.workNote = String(req.body.workNote || '').trim().slice(0, 500);
     record.photos = photos;
+    Object.assign(record, overtimeFor(hours, record.wageRate, contractor.settings));
     record.status = result.status;
     record.dayValue = result.dayValue;
     record.flags = result.flags;
@@ -180,7 +195,7 @@ router.get(
   activeWorker,
   asyncHandler(async (req, res) => {
     await closeForgottenCheckouts({ worker: req.user._id }, todayIST());
-    const filter = { worker: req.user._id };
+    const filter = { worker: req.user._id, contractor: req.user.contractor };
     if (/^\d{4}-\d{2}$/.test(req.query.month || '')) {
       filter.date = { $gte: `${req.query.month}-01`, $lte: `${req.query.month}-31` };
     }
@@ -264,5 +279,56 @@ router.post(
   })
 );
 
+/**
+ * POST /api/attendance/manual  (contractor / supervisor)
+ * { workerId, date, hours, reason }
+ * For days when the worker's phone was dead, GPS failed, or they have no smartphone.
+ * Saved as approved but clearly marked "manual_entry" with a reason, so it is auditable.
+ */
+router.post(
+  '/manual',
+  allow('contractor'),
+  asyncHandler(async (req, res) => {
+    const worker = await User.findOne({ _id: req.body.workerId, role: 'worker', contractor: req.user._id, status: 'active' });
+    if (!worker) throw httpError(404, 'Active worker not found');
+    if (!worker.assignedSite) throw httpError(400, 'Assign a site to this worker first');
+
+    const date = String(req.body.date || todayIST());
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date > todayIST()) throw httpError(400, 'Choose a valid date (not in the future)');
+    const hours = Number(req.body.hours);
+    if (!(hours > 0 && hours <= 16)) throw httpError(400, 'Hours must be between 0 and 16');
+    const reason = String(req.body.reason || '').trim();
+    if (reason.length < 3) throw httpError(400, 'Write a reason (e.g. phone not working)');
+
+    const s = req.user.settings;
+    const full = hours >= s.minHoursFullDay;
+    const half = hours >= s.minHoursHalfDay;
+    if (!half) throw httpError(400, `Less than ${s.minHoursHalfDay} hours is not counted`);
+
+    try {
+      const record = await Attendance.create({
+        worker: worker._id,
+        contractor: req.user._id,
+        site: worker.assignedSite,
+        date,
+        hours,
+        wageRate: worker.dailyWage,
+        ...(full ? overtimeFor(hours, worker.dailyWage, s) : {}),
+        status: full ? 'approved' : 'half_day',
+        dayValue: full ? 1 : 0.5,
+        manual: true,
+        manualReason: reason.slice(0, 200),
+        flags: ['manual_entry'],
+        reviewedAt: new Date(),
+      });
+      res.status(201).json({ record, message: `Attendance saved for ${worker.name}` });
+    } catch (err) {
+      if (err.code === 11000) throw httpError(409, 'Attendance for this day already exists. Review it instead');
+      throw err;
+    }
+  })
+);
+
 module.exports = router;
 module.exports.verifyDay = verifyDay; // exported for tests
+module.exports.overtimeFor = overtimeFor;
